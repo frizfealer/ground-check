@@ -41,8 +41,8 @@ transcript.
 |---|---|---|
 | The thing exists | `FABRICATED` (file on disk) | — (no file/line) |
 | In range | `BAD_LINE` | — |
-| Happened this session | `UNREAD_FILE`/`UNREAD_LINE` (opened) | output present in recorded outputs |
-| Cited content accurate | **not checked** (pointer only) | quoted output present in recorded output |
+| Happened this session | `UNREAD_FILE`/`UNREAD_LINE` (opened) | backticked output present in recorded outputs |
+| Cited content accurate | **not checked** (pointer only) | backticked output present in recorded output |
 
 So Layer 1's existence guarantee **mirrors** Read's `UNREAD_FILE` ("did this
 actually happen this session?"), and its output-match is a **new** capability
@@ -54,7 +54,8 @@ check, because it validates the quoted evidence itself.
 Goals:
 - Catch **fabricated commands/results** — a `Bash(...)` footnote whose quoted
   output was never produced this session.
-- Catch **invented specifics** — a real-looking output with a wrong number/code.
+- Catch **invented specifics** — a quoted value that does not appear in the
+  recorded output.
 - **Do not** false-positive on paraphrasing.
 - Deterministic, no re-execution, standard library only.
 
@@ -66,31 +67,41 @@ Non-goals (for this build):
   semantic Layer 2, kept opt-in (see below).
 - Re-running commands. Never.
 
-## Layer 1 — deterministic output-grounding (build now)
+## Layer 1 — verbatim-quote grounding (build now)
 
-### Inputs
-- A Bash footnote: `Bash(<cmd>) — <output text>` (the `—` / `-` separator
-  already used by the policy; `<output text>` is everything after it).
-- The recorded Bash outputs: the union of all Bash `tool_result` contents in the
-  transcript this session.
+We use an explicit **verbatim-quote (backtick) convention** rather than a
+token-classification heuristic. The author marks the spans they claim are
+verbatim by wrapping them in backticks; the verifier checks exactly those.
+This moves the decision of "what is a checkable claim" from a fragile guess the
+verifier makes to an explicit signal the author gives.
 
-### The check
-1. Parse the footnote into `<cmd>` (ignored as a label) and `<output text>`.
-2. Extract **distinctive tokens** from `<output text>` — tokens that carry
-   specific information rather than prose:
-   - contain a digit (`12`, `0`, `0.5s`, `200`), or
-   - are ALL-CAPS, length ≥ 2 (`OK`, `FAILED`, `ERROR`, `HTTP`), or
-   - contain `/` or `:` adjoining alphanumerics (`req/s`, `app.py:42`, URLs).
-   Ordinary lowercase prose words (`all`, `tests`, `pass`) are **not**
-   distinctive.
+### The check (verifier — one behavior)
+For each `Bash(<cmd>) — <output text>` footnote:
+1. Parse off `<cmd>` (ignored as a label) and `<output text>`.
+2. Extract every **backticked span** from `<output text>` (`` `…` ``).
 3. Decide:
-   - **No distinctive tokens** → the quote is pure paraphrase → **skip**; the
-     citation stays **asserted** (unchecked, as today). This is what prevents
-     paraphrase false-positives.
-   - **All distinctive tokens present** (word-boundary match) in the recorded
+   - **No backticked spans** → nothing claimed verbatim → **skip**; citation
+     stays **asserted** (unchecked, as today). This is what makes paraphrase
+     safe — un-backticked prose is never checked.
+   - **Every backticked span** is an exact substring of the recorded Bash
      outputs → **output-verified**.
-   - **Any distinctive token missing** → finding **`BASH_OUTPUT_MISMATCH`**
-     (warn-only).
+   - **Any backticked span** is absent from the recorded outputs → finding
+     **`BASH_OUTPUT_MISMATCH`** (warn-only).
+
+Matching is an exact substring test against the **union** of all recorded Bash
+`tool_result` outputs this session (we do not tie a footnote to one specific
+command — consistent with "command is just a label"). No token classification,
+no numbers heuristic, no normalization.
+
+### Authoring guidance (injected policy — "robust" style)
+The verifier treats every backticked span identically; how much to backtick is
+the author's choice. The policy text will recommend the **robust** discipline:
+backtick the **stable, meaningful** spans of output (e.g. `` `Ran 5 tests` ``,
+`` `OK` ``, `` `12 passed` ``) and leave **volatile** values (timings, memory
+addresses, PIDs, run-specific ids) as ordinary prose. Exact-quoting a whole line
+is allowed and still verifies, but backticking a volatile value is needlessly
+brittle (it changes every run). Un-backticked text stays *asserted* — honest, no
+penalty, no credit.
 
 ### Tiers and findings
 - New tier **`output-verified`** (symbol `✓`), counted with pointer-verified in
@@ -99,49 +110,44 @@ Non-goals (for this build):
   set `{pointer-verified, output-verified}`).
 - New finding code **`BASH_OUTPUT_MISMATCH`** — warn-only by default (not in
   `BLOCK_CODES`); shown in the "Grounding check:" section like other findings.
-  It may be opted into blocking later, once trusted.
-- A paraphrase-only Bash footnote remains **asserted** (`~`), exactly as today.
-
-### Matching rules
-- Match against the **union** of all recorded Bash outputs (we do not tie a
-  footnote to one specific command — consistent with "command is just a label").
-- Distinctive-token match is **word-boundary** (so cited `12` does not match
-  `120`), case-sensitive for ALL-CAPS tokens.
-- Require **all** distinctive tokens to be found; any miss → mismatch.
+  May be opted into blocking later, once trusted.
+- A Bash footnote with no backticked spans remains **asserted** (`~`), as today.
 
 ## `grounding_spec.py` changes (single source of truth)
 
 The tool taxonomy and the policy text both derive from `grounding_spec.py`, so
 Bash's new status is encoded there:
-- Add a Bash citation pattern (e.g. `BASH_CITE`) and an "output-checked" marker
-  on the Bash row, so the policy text can tell the model its Bash citations are
-  now checked (encouraging accurate output quoting) and the verifier imports the
-  same pattern. Keep `FILE_CITE`/`CHECKED` (file-pointer specific) untouched —
-  Bash uses a separate verification path, not the file-pointer path.
+- Add a backticked-span extraction pattern (e.g. `BACKTICK_SPAN`) and an
+  "output-checked" marker on the Bash row, so the policy text can tell the model
+  to put verbatim output in backticks (and that those are now checked) and the
+  verifier imports the same pattern. Keep `FILE_CITE`/`CHECKED` (file-pointer
+  specific) untouched — Bash uses a separate verification path, not the
+  file-pointer path.
+- Update the emitted policy text with the verbatim-quote convention and the
+  robust authoring guidance.
 - Extend `--check` self-consistency assertions to cover the new pattern.
 
 ## `grounding-verifier.py` changes
-- `collect()`: in addition to the `reads` map, gather `bash_outputs` — the
-  concatenation/list of Bash `tool_result` contents (and `is_error`, reserved for
-  Layer 2). Return it alongside the existing values.
-- `verify()`: when a footnote's leading atom is `Bash(...)`, run the Layer 1
-  check and assign `output-verified` / `BASH_OUTPUT_MISMATCH` / `asserted`
-  accordingly. Non-Bash recorded-output atoms (Web/Task/MCP) remain asserted.
+- `collect()`: in addition to the `reads` map, gather `bash_outputs` — the list
+  (or concatenation) of Bash `tool_result` contents this session (and
+  `is_error`, reserved for Layer 2). Return it alongside the existing values.
+- `verify()`: when a footnote's leading atom is `Bash(...)`, extract its
+  backticked spans and run the substring check, assigning `output-verified` /
+  `BASH_OUTPUT_MISMATCH` / `asserted`. Non-Bash recorded-output atoms
+  (Web/Task/MCP) remain asserted.
 - `report()`/`summary_line()`: include `output-verified` in the verified set and
   in the summary counts.
 
 ## Examples
 
-Layer 1 (output-grounding):
-
 | Footnote (output part) | Recorded output | Verdict |
 |---|---|---|
-| `Ran 5 tests … OK` | `Ran 5 tests in 0.5s … OK` | output-verified (`5`,`OK` present) |
-| `pushed: 0` | `pushed: 0` | output-verified (`0` present) |
-| `all tests pass` | `12 passed` | asserted — no distinctive token → skipped |
-| `99 passed` | `12 passed` | `BASH_OUTPUT_MISMATCH` (`99` absent) |
-| `1200 req/s` | (no such output) | `BASH_OUTPUT_MISMATCH` (`1200`,`req/s` absent) |
-| `Bash(git status) — pushed: 0` | `pushed: 0` exists | output-verified — command label wrong but output real (the accepted tradeoff) |
+| `` `Ran 5 tests`, `OK` `` | `Ran 5 tests in 0.523s … OK` | output-verified — both spans are exact substrings |
+| `` `Ran 5 tests in 0.523s` `` | `Ran 5 tests in 0.523s` | output-verified — full-line exact quote |
+| `ran the suite, `Ran 5 tests in 0.5s`` | `Ran 5 tests in 0.523s` | `BASH_OUTPUT_MISMATCH` — `0.5s` ⊄ `0.523s` (rounding caught) |
+| `all tests pass` (no backticks) | `12 passed` | asserted — nothing claimed verbatim → skipped (paraphrase safe) |
+| `` `99 passed` `` | `12 passed` | `BASH_OUTPUT_MISMATCH` — span absent (invented) |
+| `Bash(git status) — `pushed: 0`` | `pushed: 0` exists | output-verified — command label wrong but output real (accepted tradeoff) |
 
 ## Layer 2 — semantic intent check (documented, NOT built now)
 
@@ -155,22 +161,25 @@ here.
 
 ## Testing (TDD)
 - `collect()` gathers Bash outputs from a synthetic transcript.
-- Bash footnote parsing (`<cmd>` / `<output>` split).
-- Distinctive-token extraction (numbers/ALL-CAPS/`/`:`; prose excluded).
-- `verify()`: output-verified on present tokens; `BASH_OUTPUT_MISMATCH` on a
-  missing/invented token; asserted on pure paraphrase.
-- Word-boundary matching (`12` ≠ `120`).
+- Bash footnote parsing (`<cmd>` / `<output>` split; backticked-span extraction).
+- `verify()`: output-verified when all backticked spans are present;
+  `BASH_OUTPUT_MISMATCH` when a span is absent; asserted when there are no
+  backticked spans.
+- Exact-substring semantics (a rounded value like `0.5s` fails against `0.523s`).
 - Report/summary include `output-verified`; mismatch appears under "Grounding
   check:"; warn-only (no block by default).
 - `grounding_spec.py --check` still passes.
 
 ## Risks / edge cases
 - **Transcript truncation**: if Claude Code truncates very large Bash outputs in
-  the transcript, a real token could be missing → false `BASH_OUTPUT_MISMATCH`.
-  Mitigation: warn-only; revisit a dedicated `PostToolUse:Bash` cache only if
-  this proves to bite in practice.
-- **Coincidental token presence**: an invented number that happens to appear in
-  some unrelated output passes. Accepted — Layer 1 is a grounding check, not a
+  the transcript, a real backticked span could be missing → false
+  `BASH_OUTPUT_MISMATCH`. Mitigation: warn-only; revisit a dedicated
+  `PostToolUse:Bash` cache only if this proves to bite in practice.
+- **Author must backtick to earn verification**: an un-backticked Bash footnote
+  stays *asserted* (no regression, but no credit). This is intended — the
+  convention is opt-in honesty.
+- **Coincidental substring**: an invented span that happens to appear elsewhere
+  in some unrelated output passes. Accepted — Layer 1 is a grounding check, not a
   semantic one.
 - **Separator ambiguity**: a command containing `—`/`-` could confuse the
   cmd/output split; parse the command greedily to the last `)` before the
@@ -180,5 +189,5 @@ here.
 ## Rollout
 - Warn-only by default (`BASH_OUTPUT_MISMATCH` not in `BLOCK_CODES`), matching
   the project's "watch the warnings first" stance.
-- README "Scope" note updated: Bash output is now grounded (existence of the
-  quoted output), still not semantically judged.
+- README "Scope" note updated: backticked Bash output is now grounded (the quoted
+  span really appears in the recorded output), still not semantically judged.
