@@ -1,193 +1,181 @@
-# Bash citation verification — design
+# Citation content verification — design
 
 Date: 2026-06-21
 Status: approved (brainstorming) — ready for implementation plan
 Scope: `scripts/grounding_spec.py`, `scripts/grounding-verifier.py`, tests
 
+Covers two citation kinds via **one** verbatim-quote (backtick) convention:
+- **Bash output** — move `Bash(<cmd>) — <output>` from *asserted* toward
+  *verified* (the original focus of this spec).
+- **File-line content** — add an opt-in content check on top of the existing
+  `Read`/`Edit`/`Write`/`MultiEdit` pointer check.
+
 ## Problem
 
-Today the verifier treats `Bash(<cmd>) — <output>` citations as **asserted
-(unchecked)** — it takes the model's word for them. Asserted is honest (we can't
-re-run Bash safely or deterministically), but it leaves the most common
-recorded-output citation entirely unverified. We want to move Bash from
-*asserted* toward *verified* without re-executing anything.
+- Bash citations are treated as **asserted (unchecked)** — honest, but the most
+  common recorded-output citation goes entirely unverified.
+- File citations are **pointer-only**: the verifier checks the file exists, the
+  line is in range, and the file/line was opened — but never compares the cited
+  prose to the actual content at that line.
 
-## Key realization (the framing this design rests on)
+We want to ground both, deterministically, without re-executing anything, using
+one shared mechanism.
 
-A Bash citation has two parts: the **command** (a human-readable label) and the
-**output** (the evidence). The command string is the weakest thing to match —
-footnotes cite a fragment of a compound command, drop flags, reformat pipes — so
-matching it is brittle and false-positive-prone.
+## Key realization
 
-**The evidence is the output, not the command.** So we key the check on the
-output and treat the command as an unchecked label. The transcript already holds
-every Bash command, its full output, and an `is_error` flag, and the verifier
-already reads the transcript — so no separate cache file is needed.
+For both kinds, **the evidence is the content, not the locator.** For Bash the
+locator is the command (a label); for a file it's `path:line` (a pointer). In
+both cases the trustworthy check is: *does the quoted content actually appear in
+the real source?*
 
-### Relationship to the existing Read/Edit check
+The hard part is telling a *verbatim claim* apart from the author's *prose*. We
+solve it with an explicit **backtick convention**: the author wraps spans they
+claim are verbatim in backticks, and the verifier checks exactly those. This
+moves "what is a checkable claim" from a fragile guess to an explicit signal —
+and the same rule serves both sources. The transcript already holds Bash
+commands + full output + `is_error`; files are re-readable on disk; no cache file
+is needed.
 
-A `Read(path:line)` citation is a pure **pointer**; the verifier checks the
-pointer (file exists → `FABRICATED`, line in range → `BAD_LINE`, file/line
-actually opened this session → `UNREAD_FILE`/`UNREAD_LINE`) and never compares
-the cited prose to the file's content. Content correctness is deliberately left
-to the optional semantic layer.
+### Relationship to the existing Read/Edit check (updated)
 
-Bash is different because its output is **ephemeral** — it can't be re-opened
-from disk later, so the citation embeds the output and the only way to ground it
-is to match that embedded text against the single recorded copy in the
-transcript.
+| Dimension | Read/Edit before | Read/Edit after | Bash |
+|---|---|---|---|
+| Locator exists | `FABRICATED` | `FABRICATED` | — |
+| In range | `BAD_LINE` | `BAD_LINE` | — |
+| Happened this session | `UNREAD_FILE`/`UNREAD_LINE` | same | backticked output in recorded outputs |
+| **Cited content accurate** | **not checked** | **checked when backticked (opt-in)** → `CONTENT_MISMATCH` | backticked output in recorded output → `BASH_OUTPUT_MISMATCH` |
 
-| Dimension | Read/Edit (today) | Bash Layer 1 (this design) |
-|---|---|---|
-| The thing exists | `FABRICATED` (file on disk) | — (no file/line) |
-| In range | `BAD_LINE` | — |
-| Happened this session | `UNREAD_FILE`/`UNREAD_LINE` (opened) | backticked output present in recorded outputs |
-| Cited content accurate | **not checked** (pointer only) | backticked output present in recorded output |
+The existence guarantee is the same idea across both; the content check is the
+new, shared capability.
 
-So Layer 1's existence guarantee **mirrors** Read's `UNREAD_FILE` ("did this
-actually happen this session?"), and its output-match is a **new** capability
-with no Read equivalent — in the content dimension it is *stronger* than the Read
-check, because it validates the quoted evidence itself.
+## The mechanism — verbatim-quote grounding (one rule, two sources)
 
-## Goals / non-goals
+The verifier has **one behavior**: for a footnote, extract every backticked span
+(`` `…` ``) from its content portion and check each is an **exact substring** of
+the relevant source.
 
-Goals:
-- Catch **fabricated commands/results** — a `Bash(...)` footnote whose quoted
-  output was never produced this session.
-- Catch **invented specifics** — a quoted value that does not appear in the
-  recorded output.
-- **Do not** false-positive on paraphrasing.
-- Deterministic, no re-execution, standard library only.
+- **Bash** (`Bash(<cmd>) — <output>`): match each backticked span against the
+  **union of all recorded Bash `tool_result` outputs** this session. (The
+  command is an unchecked label.)
+- **File** (`Read(path:line) — `…``): match each backticked span against the
+  **current file at the cited line/range**. Runs only after the pointer checks
+  pass. Indentation is handled for free (substring match: `` `def foo():` `` is a
+  substring of `    def foo():`).
 
-Non-goals (for this build):
-- Verifying the command string itself (accepted tradeoff: a mislabeled command
-  with a real output passes — inventing *results* is the dangerous lie;
-  mislabeling a command is cosmetic).
-- Judging whether the model's *claim* follows from the output — that's the
-  semantic Layer 2, kept opt-in (see below).
-- Re-running commands. Never.
+Decision (identical shape for both):
+- **No backticked spans** → nothing claimed verbatim → **skip**; citation keeps
+  its current tier (Bash → *asserted*; file → *pointer-verified*). Paraphrase is
+  never checked, so it never false-positives.
+- **All backticked spans present** → Bash becomes **output-verified**; file stays
+  **pointer-verified** (the content check adds confidence, not a new tier).
+- **Any backticked span absent** → a warn-only finding:
+  - Bash → **`BASH_OUTPUT_MISMATCH`**
+  - File → **`CONTENT_MISMATCH`**
 
-## Layer 1 — verbatim-quote grounding (build now)
+No token classification, no numbers heuristic, no normalization beyond exact
+substring.
 
-We use an explicit **verbatim-quote (backtick) convention** rather than a
-token-classification heuristic. The author marks the spans they claim are
-verbatim by wrapping them in backticks; the verifier checks exactly those.
-This moves the decision of "what is a checkable claim" from a fragile guess the
-verifier makes to an explicit signal the author gives.
+### Bonus for files: catches stale line numbers
 
-### The check (verifier — one behavior)
-For each `Bash(<cmd>) — <output text>` footnote:
-1. Parse off `<cmd>` (ignored as a label) and `<output text>`.
-2. Extract every **backticked span** from `<output text>` (`` `…` ``).
-3. Decide:
-   - **No backticked spans** → nothing claimed verbatim → **skip**; citation
-     stays **asserted** (unchecked, as today). This is what makes paraphrase
-     safe — un-backticked prose is never checked.
-   - **Every backticked span** is an exact substring of the recorded Bash
-     outputs → **output-verified**.
-   - **Any backticked span** is absent from the recorded outputs → finding
-     **`BASH_OUTPUT_MISMATCH`** (warn-only).
+`BAD_LINE` only catches a line that is now *out of range*. The content check also
+catches a line number that **drifted** — `Read(app.py:42) — `def foo():`` where
+line 42 still exists but the code moved — which `BAD_LINE` cannot. Warn-only, so
+active-editing churn never blocks.
 
-Matching is an exact substring test against the **union** of all recorded Bash
-`tool_result` outputs this session (we do not tie a footnote to one specific
-command — consistent with "command is just a label"). No token classification,
-no numbers heuristic, no normalization.
+## File content check: opt-in + light policy mention (cost control)
 
-### Authoring guidance (injected policy — "robust" style)
-The verifier treats every backticked span identically; how much to backtick is
-the author's choice. The policy text will recommend the **robust** discipline:
-backtick the **stable, meaningful** spans of output (e.g. `` `Ran 5 tests` ``,
-`` `OK` ``, `` `12 passed` ``) and leave **volatile** values (timings, memory
-addresses, PIDs, run-specific ids) as ordinary prose. Exact-quoting a whole line
-is allowed and still verifies, but backticking a volatile value is needlessly
-brittle (it changes every run). Un-backticked text stays *asserted* — honest, no
-penalty, no credit.
+The file content check is **purely opt-in**:
+- The **verifier** checks backticked file content *if present* — this costs
+  nothing until used.
+- The **policy** gets only a *light* mention: "you *may* backtick the exact line
+  content for a stronger check — only if that content is already in your context;
+  do **not** re-read a file just to quote it." No mandate.
 
-### Tiers and findings
-- New tier **`output-verified`** (symbol `✓`), counted with pointer-verified in
-  the trust summary and listed in the report alongside pointer-verified (the
-  report's "list only verified" rule generalizes from `pointer-verified` to the
-  set `{pointer-verified, output-verified}`).
-- New finding code **`BASH_OUTPUT_MISMATCH`** — warn-only by default (not in
-  `BLOCK_CODES`); shown in the "Grounding check:" section like other findings.
-  May be opted into blocking later, once trusted.
-- A Bash footnote with no backticked spans remains **asserted** (`~`), as today.
+Rationale (token cost, measured): the injected policy is ~1,516 tokens/turn
+today. The backtick convention is already introduced for Bash, so extending it
+to files is ~one sentence (~20 tokens, cached). Per-citation output cost is a
+small snippet, and only when used. The real cost to avoid is **induced re-reads**
+(re-opening a file just to quote it) — hence the explicit "only if already in
+context" guidance.
 
 ## `grounding_spec.py` changes (single source of truth)
-
-The tool taxonomy and the policy text both derive from `grounding_spec.py`, so
-Bash's new status is encoded there:
-- Add a backticked-span extraction pattern (e.g. `BACKTICK_SPAN`) and an
-  "output-checked" marker on the Bash row, so the policy text can tell the model
-  to put verbatim output in backticks (and that those are now checked) and the
-  verifier imports the same pattern. Keep `FILE_CITE`/`CHECKED` (file-pointer
-  specific) untouched — Bash uses a separate verification path, not the
-  file-pointer path.
-- Update the emitted policy text with the verbatim-quote convention and the
-  robust authoring guidance.
-- Extend `--check` self-consistency assertions to cover the new pattern.
+- Add a backticked-span extraction pattern (e.g. `BACKTICK_SPAN`), shared by both
+  sources. Mark Bash as "output-checked"; keep `FILE_CITE`/`CHECKED`
+  (file-pointer specific) as-is — content checking is a separate path layered on
+  top of the pointer path.
+- Update emitted policy text: the verbatim-quote convention for Bash (encouraged)
+  and the light, opt-in mention for file content (with the no-re-read caveat).
+- Extend `--check` assertions to cover the new pattern.
 
 ## `grounding-verifier.py` changes
-- `collect()`: in addition to the `reads` map, gather `bash_outputs` — the list
-  (or concatenation) of Bash `tool_result` contents this session (and
-  `is_error`, reserved for Layer 2). Return it alongside the existing values.
-- `verify()`: when a footnote's leading atom is `Bash(...)`, extract its
-  backticked spans and run the substring check, assigning `output-verified` /
-  `BASH_OUTPUT_MISMATCH` / `asserted`. Non-Bash recorded-output atoms
-  (Web/Task/MCP) remain asserted.
+- `collect()`: also gather `bash_outputs` (list of Bash `tool_result` contents,
+  plus `is_error` reserved for Layer 2). Keep the existing `reads` map.
+- `verify()`:
+  - Bash atom → extract backticked spans, match against `bash_outputs` →
+    `output-verified` / `BASH_OUTPUT_MISMATCH` / `asserted`.
+  - File atom → after the existing pointer checks, if backticked spans are
+    present, read the cited line/range from the resolved file and match → keep
+    `pointer-verified` or add `CONTENT_MISMATCH`.
 - `report()`/`summary_line()`: include `output-verified` in the verified set and
-  in the summary counts.
+  counts; surface `CONTENT_MISMATCH`/`BASH_OUTPUT_MISMATCH` in "Grounding check:".
 
 ## Examples
 
+File:
+
+| Footnote | Current line 42 | Verdict |
+|---|---|---|
+| `Read(app.py:42)` | (any) | pointer-verified — no backtick, content not checked (today's behavior) |
+| `Read(app.py:42) — `def foo():`` | `    def foo():` | pointer-verified — span is a substring (indentation tolerated) |
+| `Read(app.py:42) — `def foo():`` | `    def bar():` | `CONTENT_MISMATCH` — span absent at line 42 (drift/misquote caught) |
+
+Bash:
+
 | Footnote (output part) | Recorded output | Verdict |
 |---|---|---|
-| `` `Ran 5 tests`, `OK` `` | `Ran 5 tests in 0.523s … OK` | output-verified — both spans are exact substrings |
-| `` `Ran 5 tests in 0.523s` `` | `Ran 5 tests in 0.523s` | output-verified — full-line exact quote |
-| `ran the suite, `Ran 5 tests in 0.5s`` | `Ran 5 tests in 0.523s` | `BASH_OUTPUT_MISMATCH` — `0.5s` ⊄ `0.523s` (rounding caught) |
-| `all tests pass` (no backticks) | `12 passed` | asserted — nothing claimed verbatim → skipped (paraphrase safe) |
-| `` `99 passed` `` | `12 passed` | `BASH_OUTPUT_MISMATCH` — span absent (invented) |
+| `` `Ran 5 tests`, `OK` `` | `Ran 5 tests in 0.523s … OK` | output-verified |
+| `ran the suite, `Ran 5 tests in 0.5s`` | `Ran 5 tests in 0.523s` | `BASH_OUTPUT_MISMATCH` — `0.5s` ⊄ `0.523s` |
+| `all tests pass` (no backticks) | `12 passed` | asserted — nothing claimed verbatim |
 | `Bash(git status) — `pushed: 0`` | `pushed: 0` exists | output-verified — command label wrong but output real (accepted tradeoff) |
 
 ## Layer 2 — semantic intent check (documented, NOT built now)
 
-Deciding whether the model's *claim* follows from command+output (e.g. claim
-"all tests pass" vs output "12 passed, 3 failed") is a semantic judgment that
-needs a model. This is exactly the existing **OPTIONAL ESCALATION** noted at the
-bottom of `grounding-verifier.py` (a second model call asking "does \<claim\>
-follow from \<output\>"). It stays **opt-in and out of the deterministic core**.
-This design only records it as the planned future layer; it is not implemented
-here.
+Whether the model's *claim* follows from the content (e.g. "all tests pass" vs
+output `12 passed, 3 failed`) is a semantic judgment needing a model — the
+existing **OPTIONAL ESCALATION** in `grounding-verifier.py` (a second model call).
+Stays opt-in and out of the deterministic core; not implemented here.
 
 ## Testing (TDD)
 - `collect()` gathers Bash outputs from a synthetic transcript.
-- Bash footnote parsing (`<cmd>` / `<output>` split; backticked-span extraction).
-- `verify()`: output-verified when all backticked spans are present;
-  `BASH_OUTPUT_MISMATCH` when a span is absent; asserted when there are no
-  backticked spans.
-- Exact-substring semantics (a rounded value like `0.5s` fails against `0.523s`).
-- Report/summary include `output-verified`; mismatch appears under "Grounding
-  check:"; warn-only (no block by default).
+- Backticked-span extraction from a footnote's content portion.
+- Bash: output-verified when all spans present; `BASH_OUTPUT_MISMATCH` when a span
+  is absent; asserted when no spans.
+- File: pointer-verified + content match passes; `CONTENT_MISMATCH` when a
+  backticked span is not at the cited line; pointer-only (no backtick) unchanged;
+  indentation tolerated; stale/drifted line caught.
+- Exact-substring semantics (`0.5s` fails against `0.523s`).
+- Report/summary include `output-verified`; mismatches under "Grounding check:";
+  all warn-only by default.
 - `grounding_spec.py --check` still passes.
 
 ## Risks / edge cases
-- **Transcript truncation**: if Claude Code truncates very large Bash outputs in
-  the transcript, a real backticked span could be missing → false
-  `BASH_OUTPUT_MISMATCH`. Mitigation: warn-only; revisit a dedicated
-  `PostToolUse:Bash` cache only if this proves to bite in practice.
-- **Author must backtick to earn verification**: an un-backticked Bash footnote
-  stays *asserted* (no regression, but no credit). This is intended — the
-  convention is opt-in honesty.
-- **Coincidental substring**: an invented span that happens to appear elsewhere
-  in some unrelated output passes. Accepted — Layer 1 is a grounding check, not a
-  semantic one.
-- **Separator ambiguity**: a command containing `—`/`-` could confuse the
-  cmd/output split; parse the command greedily to the last `)` before the
-  separator.
-- **Command label unverified**: documented tradeoff above.
+- **Induced re-reads (files)**: model re-opens a file just to quote it → extra
+  tokens/latency. Mitigation: policy says quote only what's already in context.
+- **Transcript truncation (Bash)**: very large outputs may be truncated → false
+  `BASH_OUTPUT_MISMATCH`. Mitigation: warn-only; revisit a `PostToolUse:Bash`
+  cache only if it bites.
+- **Staleness during active edits (files)**: a line edited after being read may
+  fail the content check. Partly the feature (drift detection); warn-only.
+- **Coincidental substring**: an invented span that appears elsewhere passes.
+  Accepted — this is a grounding check, not a semantic one.
+- **Separator ambiguity (Bash)**: a command containing `—`/`-`; parse the command
+  greedily to the last `)` before the separator.
+- **Locator-not-verified (Bash)**: command label unchecked — documented tradeoff.
 
 ## Rollout
-- Warn-only by default (`BASH_OUTPUT_MISMATCH` not in `BLOCK_CODES`), matching
-  the project's "watch the warnings first" stance.
-- README "Scope" note updated: backticked Bash output is now grounded (the quoted
-  span really appears in the recorded output), still not semantically judged.
+- All new findings warn-only by default (`CONTENT_MISMATCH`,
+  `BASH_OUTPUT_MISMATCH` not in `BLOCK_CODES`).
+- File content check is opt-in with only a light policy mention.
+- README "Scope" note updated: backticked Bash output and backticked file-line
+  content are now grounded (the quoted span really appears in the source), still
+  not semantically judged.
