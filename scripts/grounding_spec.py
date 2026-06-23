@@ -216,11 +216,18 @@ VERIFIABLE / filesystem-checkable — the effect is on disk, re-readable NOW:
   Cite a real path, a line that exists, a file you opened/changed THIS session
   with the Read/Edit/Write tools — if grep or a search gave you the line instead,
   that's a Grep(pattern) or Bash(<cmd>) citation, NOT Read(path:line).
+  You MAY also quote the exact cited line content in backticks for a stronger
+  check — but ONLY if it is already in your context; never re-read a file just
+  to quote it.
 
 VERIFIABLE / recorded-output — the call happened and you captured its result,
 but it is NOT safely or deterministically re-runnable. Cite the call AND show
 the relevant output you actually got:
 %%RECORDED_LIST%%
+
+For a Bash citation, wrap the exact output you are claiming in backticks; the
+verifier confirms each backticked span is a verbatim substring of the recorded
+output (output-verified). Prose you do not backtick is never checked.
 
 VERIFIABLE / conversation — recorded in the session transcript (the JSONL on
 disk at transcript_path, which the hook already reads), so it is checkable by

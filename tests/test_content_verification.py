@@ -236,5 +236,13 @@ class TestReportingTiers(unittest.TestCase):
         self.assertNotIn("BASH_OUTPUT_MISMATCH", self.mod.BLOCK_CODES)
 
 
+class TestPolicyText(unittest.TestCase):
+    def test_policy_mentions_backtick_convention(self):
+        """Should document the verbatim-quote (backtick) convention in the policy."""
+        policy = grounding_spec.render_policy()
+        self.assertIn("backtick", policy.lower())
+        self.assertIn("output-verified", policy)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
