@@ -60,6 +60,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from grounding_spec import (  # noqa: E402
     ALL_TOOLS,
     ANY_CITATION,
+    BACKTICK_SPAN,
     CITE_FULL_RE,
     FILE_CITE,
     RANGE_TOOLS,
@@ -325,18 +326,60 @@ def file_line_count(path):
         return None
 
 
-def verify(text, reads, cwd):
+# A footnote whose leading atom is a Bash citation: its backticked output spans
+# are checked against the session's recorded Bash output.
+_BASH_ATOM_RE = re.compile(r"^\s*Bash\s*\(")
+
+
+def _classify_recorded(body, bash_outputs):
+    """Tier a non-filesystem footnote. Bash footnotes get verbatim-quote checking
+    against recorded output; everything else (Web/Task/MCP/Grep/Glob/context) is
+    'asserted'. Returns (tier, finding_or_None)."""
+    if not _BASH_ATOM_RE.match(body):
+        return "asserted", None
+    spans = BACKTICK_SPAN.findall(body)
+    if not spans:
+        return "asserted", None  # nothing claimed verbatim
+    missing = [sp for sp in spans if not any(sp in out for out in bash_outputs)]
+    if missing:
+        return "BASH_OUTPUT_MISMATCH", (
+            "BASH_OUTPUT_MISMATCH",
+            "%s — quoted output not found in this session's recorded Bash "
+            "output: %r (stale quote, misquote, or resumed session)"
+            % (body, missing[0]),
+        )
+    return "output-verified", None
+
+
+def _tally(cited):
+    """Count citation tiers for the trust summary."""
+    tiers = [t for _, t in cited]
+    fail = {"FABRICATED", "BAD_LINE", "UNREAD_FILE", "UNREAD_LINE"}
+    mismatch = {"CONTENT_MISMATCH", "BASH_OUTPUT_MISMATCH"}
+    return {
+        "pointer_verified": tiers.count("pointer-verified"),
+        "output_verified": tiers.count("output-verified"),
+        "asserted": tiers.count("asserted"),
+        "failed": sum(1 for t in tiers if t in fail),
+        "mismatched": sum(1 for t in tiers if t in mismatch),
+    }
+
+
+def verify(text, reads, bash_outputs, cwd):
     """Verify ONLY the footnote definitions — the authoritative citation list.
 
-    Each footnote is judged by its LEADING atom: a filesystem atom (Read / Edit /
-    Write / MultiEdit at the start of the footnote) is checked against disk and
-    the session reads; anything else (Bash / Web / Task / MCP / Grep / Glob /
-    context, or a trailing description) is "asserted". Atoms that merely appear in
-    prose, or inside a recorded-output footnote's command/output, are NOT
-    citations and are never checked — only what you put in the footnote block is.
+    Each footnote is judged by its LEADING atom:
+      - a filesystem atom (Read/Edit/Write/MultiEdit) is checked against disk and
+        the session reads; if its pointer holds and it backticks line content,
+        that span is checked against the cited line/range (CONTENT_MISMATCH on a
+        miss) — see Task 4.
+      - a Bash atom has its backticked output spans checked against the union of
+        recorded Bash outputs (output-verified / BASH_OUTPUT_MISMATCH).
+      - anything else is "asserted".
+    Spans the author did not backtick are never checked, so paraphrase never
+    false-positives.
     """
     findings = []  # (code, message)
-    pointer_verified = 0
     cited = []     # (display, tier) per footnote, in order, de-duplicated
     seen = set()
 
@@ -344,28 +387,29 @@ def verify(text, reads, cwd):
         body = cm.group(1).strip()
         m = FILE_CITE.match(body)  # a checked filesystem atom at the START?
         if not m:
-            # recorded-output / conversation / unchecked footnote -> asserted
-            if body not in seen:
-                seen.add(body)
-                cited.append((body, "asserted"))
+            if body in seen:
+                continue
+            seen.add(body)
+            tier, finding = _classify_recorded(body, bash_outputs)
+            if finding:
+                findings.append(finding)
+            cited.append((body, tier))
             continue
 
         atom = m.group(0)
         if atom in seen:
             continue
         seen.add(atom)
-        tool, path, s, e = m.group(1), m.group(2), m.group(3), m.group(4)
+        path, s = m.group(2), m.group(3)
         line = int(s) if s else None
         before = len(findings)
 
         abspath = resolve_path(path, cwd, list(reads.keys()))
         if abspath is None:
             findings.append(
-                (
-                    "FABRICATED",
-                    f"{atom} — no such file found "
-                    f"(checked cwd, git root, and read files)",
-                )
+                ("FABRICATED",
+                 f"{atom} — no such file found "
+                 f"(checked cwd, git root, and read files)")
             )
             cited.append((atom, "FABRICATED"))
             continue
@@ -374,11 +418,9 @@ def verify(text, reads, cwd):
             n = file_line_count(abspath)
             if n is not None and line > n:
                 findings.append(
-                    (
-                        "BAD_LINE",
-                        f"{atom} — file now has only {n} lines "
-                        f"(stale citation, or wrong line)",
-                    )
+                    ("BAD_LINE",
+                     f"{atom} — file now has only {n} lines "
+                     f"(stale citation, or wrong line)")
                 )
                 cited.append((atom, "BAD_LINE"))
                 continue
@@ -387,39 +429,23 @@ def verify(text, reads, cwd):
         read_state = line_was_read(reads, rp, line)
         if read_state is None:
             findings.append(
-                (
-                    "UNREAD_FILE",
-                    f"{atom} — cited but not opened this session "
-                    f"(ok if resumed from a prior session)",
-                )
+                ("UNREAD_FILE",
+                 f"{atom} — cited but not opened this session "
+                 f"(ok if resumed from a prior session)")
             )
         elif read_state is False:
             findings.append(
-                (
-                    "UNREAD_LINE",
-                    f"{atom} — file opened, but this line was never in a read range",
-                )
+                ("UNREAD_LINE",
+                 f"{atom} — file opened, but this line was never in a read range")
             )
 
-        if len(findings) == before:
-            pointer_verified += 1
-            cited.append((atom, "pointer-verified"))
-        else:
-            cited.append((atom, findings[-1][0]))  # the failure code
+        if len(findings) != before:
+            cited.append((atom, findings[-1][0]))  # pointer failure
+            continue
 
-    fail_codes = {"FABRICATED", "BAD_LINE", "UNREAD_FILE", "UNREAD_LINE"}
-    failed = sum(1 for c, _ in findings if c in fail_codes)
+        cited.append((atom, "pointer-verified"))
 
-    # "asserted" = footnotes we could not check (recorded-output / Grep / Glob /
-    # context). Every footnote is in `cited`; the rest are pointer-verified or
-    # failed, so the asserted count is just what's left over.
-    asserted = max(0, len(cited) - pointer_verified - failed)
-
-    stats = {
-        "pointer_verified": pointer_verified,
-        "asserted": asserted,
-        "failed": failed,
-    }
+    stats = _tally(cited)
 
     if not ANY_CITATION.search(text or "") and len((text or "").strip()) > 600:
         findings.append(("NO_CITATIONS", "Substantial answer with no citations"))
@@ -555,7 +581,7 @@ def main():
     wait_for_stable_transcript(transcript_path)
 
     reads, bash_outputs, text = collect(transcript_path, cwd)
-    findings, stats, cited = verify(text, reads, cwd)
+    findings, stats, cited = verify(text, reads, bash_outputs, cwd)
     blocking = [f for f in findings if f[0] in BLOCK_CODES]
 
     block, note = should_block(session_id, stop_active, blocking)
