@@ -141,5 +141,63 @@ class TestVerifyBashOutput(unittest.TestCase):
         self.assertEqual(stats["mismatched"], 1)
 
 
+class TestVerifyFileContent(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_verifier()
+
+    def _file(self, lines):
+        fd, path = tempfile.mkstemp(suffix=".py")
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        return path
+
+    def _verify_read(self, path, line, quoted):
+        reads = {os.path.realpath(path): "ALL"}
+        body = "Read(%s:%d)" % (path, line)
+        if quoted is not None:
+            body += " — `%s`" % quoted
+        text = "Claim `[1]`.\n\n`[1]` " + body
+        return self.mod.verify(text, reads, [], os.path.dirname(path))
+
+    def test_pointer_verified_when_content_matches(self):
+        """Should stay pointer-verified when the span is at the cited line."""
+        p = self._file(["import os", "def foo():", "    return 1"])
+        try:
+            findings, stats, cited = self._verify_read(p, 2, "def foo():")
+        finally:
+            os.remove(p)
+        self.assertEqual(stats["pointer_verified"], 1)
+        self.assertFalse([f for f in findings if f[0] == "CONTENT_MISMATCH"])
+
+    def test_content_mismatch_when_span_absent(self):
+        """Should flag CONTENT_MISMATCH when the span is not at the cited line."""
+        p = self._file(["import os", "def foo():", "    return 1"])
+        try:
+            findings, stats, cited = self._verify_read(p, 2, "def bar():")
+        finally:
+            os.remove(p)
+        self.assertIn("CONTENT_MISMATCH", [f[0] for f in findings])
+        self.assertEqual(stats["mismatched"], 1)
+
+    def test_indentation_tolerated(self):
+        """Should match a span that is a substring of an indented line."""
+        p = self._file(["def foo():", "    return 1"])
+        try:
+            findings, stats, cited = self._verify_read(p, 2, "return 1")
+        finally:
+            os.remove(p)
+        self.assertEqual(stats["pointer_verified"], 1)
+
+    def test_pointer_only_when_no_backticks(self):
+        """Should behave exactly as before when no content is backticked."""
+        p = self._file(["def foo():", "    return 1"])
+        try:
+            findings, stats, cited = self._verify_read(p, 1, None)
+        finally:
+            os.remove(p)
+        self.assertEqual(stats["pointer_verified"], 1)
+        self.assertFalse(findings)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

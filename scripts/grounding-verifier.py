@@ -326,6 +326,22 @@ def file_line_count(path):
         return None
 
 
+def read_cited_text(path, start, end):
+    """Text of the cited line/range (1-indexed, inclusive), or the whole file
+    when no line was cited. None on read error (then the content check is
+    skipped — never a false mismatch)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return None
+    if start is None:
+        return "\n".join(lines)
+    lo = max(1, start)
+    hi = end if (end is not None and end >= lo) else lo
+    return "\n".join(lines[lo - 1:hi])
+
+
 # A footnote whose leading atom is a Bash citation: its backticked output spans
 # are checked against the session's recorded Bash output.
 _BASH_ATOM_RE = re.compile(r"^\s*Bash\s*\(")
@@ -400,8 +416,9 @@ def verify(text, reads, bash_outputs, cwd):
         if atom in seen:
             continue
         seen.add(atom)
-        path, s = m.group(2), m.group(3)
+        path, s, e = m.group(2), m.group(3), m.group(4)
         line = int(s) if s else None
+        end = int(e) if e else None
         before = len(findings)
 
         abspath = resolve_path(path, cwd, list(reads.keys()))
@@ -443,6 +460,21 @@ def verify(text, reads, bash_outputs, cwd):
             cited.append((atom, findings[-1][0]))  # pointer failure
             continue
 
+        # Pointer holds. Opt-in content check: if the footnote backticks the cited
+        # line content, confirm each span is verbatim at the cited line/range.
+        spans = BACKTICK_SPAN.findall(body[m.end():])
+        if spans:
+            cited_text = read_cited_text(abspath, line, end)
+            if cited_text is not None:
+                missing = [sp for sp in spans if sp not in cited_text]
+                if missing:
+                    findings.append(
+                        ("CONTENT_MISMATCH",
+                         f"{atom} — quoted content not found at the cited "
+                         f"line/range: {missing[0]!r}")
+                    )
+                    cited.append((atom, "CONTENT_MISMATCH"))
+                    continue
         cited.append((atom, "pointer-verified"))
 
     stats = _tally(cited)
