@@ -142,6 +142,11 @@ CITE_ATOM_RE = re.compile(_MARK_PAT + r"\s*([A-Za-z_]+)\s*\(")
 # Derived from the markers above so it never drifts.
 ANY_CITATION = re.compile(_MARK_PAT + r"|" + re.escape(WARN_GLYPH))
 
+# Verbatim-quote convention (shared by Bash output and file-line content checks):
+# the author wraps spans they claim are verbatim in backticks; the verifier checks
+# exactly those against the real source. findall -> the inner text of each span.
+BACKTICK_SPAN = re.compile(r"`([^`]+)`")
+
 
 def is_checked(tool_name):
     """True if the verifier mechanically checks citations of this tool."""
@@ -296,6 +301,10 @@ def _check():
     assert ANY_CITATION.search(mark(1)), "inline marker not detected"
     assert ANY_CITATION.search(warn("x")), "unverified warning not detected"
     assert rx.search(cite("Read(f.py:1)")), "FILE_CITE fails on code-span atom"
+    # backticked-span extraction: the shared verbatim-quote convention
+    spans = BACKTICK_SPAN.findall("Bash(x) — `Ran 5 tests`, `OK`")
+    assert spans == ["Ran 5 tests", "OK"], "BACKTICK_SPAN extraction wrong: %r" % spans
+    assert BACKTICK_SPAN.findall("no backticks here") == [], "BACKTICK_SPAN matched prose"
     print("grounding_spec OK — %d tools; checked=%s; range=%s; all=%s"
           % (len(TOOLS), ",".join(CHECKED), ",".join(RANGE_TOOLS), ",".join(ALL_TOOLS)))
 
