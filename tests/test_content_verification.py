@@ -36,5 +36,56 @@ class TestBacktickSpan(unittest.TestCase):
         self.assertEqual(grounding_spec.BACKTICK_SPAN.findall("all tests pass"), [])
 
 
+import json
+
+
+def _write_transcript(rows):
+    fd, path = tempfile.mkstemp(suffix=".jsonl")
+    with os.fdopen(fd, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    return path
+
+
+class TestCollectBashOutputs(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_verifier()
+
+    def test_collects_bash_tool_result_output(self):
+        """Should return the text of each Bash tool_result as bash_outputs."""
+        rows = [
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "b1", "name": "Bash",
+                 "input": {"command": "npm test"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "b1",
+                 "content": "Ran 5 tests in 0.523s\nOK"}]}},
+        ]
+        tr = _write_transcript(rows)
+        try:
+            reads, bash_outputs, text = self.mod.collect(tr, REPO)
+        finally:
+            os.remove(tr)
+        self.assertEqual(len(bash_outputs), 1)
+        self.assertIn("Ran 5 tests in 0.523s", bash_outputs[0])
+
+    def test_ignores_non_bash_tool_results(self):
+        """Should not collect tool_results whose tool_use was not Bash."""
+        rows = [
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "r1", "name": "Read",
+                 "input": {"file_path": "/tmp/x.py"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "r1",
+                 "content": "file contents"}]}},
+        ]
+        tr = _write_transcript(rows)
+        try:
+            reads, bash_outputs, text = self.mod.collect(tr, REPO)
+        finally:
+            os.remove(tr)
+        self.assertEqual(bash_outputs, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

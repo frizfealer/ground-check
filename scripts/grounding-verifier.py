@@ -226,16 +226,35 @@ def _is_user_prompt(entry):
     return has_text and not has_tool_result
 
 
+def _tool_result_text(block):
+    """Best-effort plain text of a tool_result block's content (a string, or a
+    list of {type:'text', text:...} parts). '' if none."""
+    c = block.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "".join(
+            part.get("text", "")
+            for part in c
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
 def collect(transcript_path, cwd):
-    """Return (reads, last_assistant_text).
+    """Return (reads, bash_outputs, last_assistant_text).
 
     reads: { realpath: "ALL" | list[(start,end|None)] }  -- lines opened this session
+    bash_outputs: list[str] -- the text of every Bash tool_result this session,
+      for verbatim-quote checking of Bash citations.
     last_assistant_text: ALL assistant text of the current turn, concatenated.
       A single answer is split across many assistant entries interleaved with
       tool calls, so we accumulate every assistant text chunk produced since the
       last genuine user prompt — not just the final fragment.
     """
     reads = {}
+    bash_outputs = []
+    bash_ids = set()
     answer_parts = []
 
     def real(p):
@@ -247,26 +266,35 @@ def collect(transcript_path, cwd):
         for b in blocks_of(entry):
             if not isinstance(b, dict):
                 continue
-            if b.get("type") != "tool_use":
-                continue
-            name = b.get("name")
-            inp = b.get("input") or {}
-            p = inp.get("file_path") or inp.get("path")
-            if not p:
-                continue
-            rp = real(p)
-            if name in RANGE_TOOLS:
-                offset = inp.get("offset")
-                limit = inp.get("limit")
-                if offset is None and limit is None:
+            btype = b.get("type")
+            if btype == "tool_use":
+                name = b.get("name")
+                inp = b.get("input") or {}
+                if name == "Bash":
+                    bid = b.get("id")
+                    if bid:
+                        bash_ids.add(bid)
+                p = inp.get("file_path") or inp.get("path")
+                if not p:
+                    continue
+                rp = real(p)
+                if name in RANGE_TOOLS:
+                    offset = inp.get("offset")
+                    limit = inp.get("limit")
+                    if offset is None and limit is None:
+                        reads[rp] = "ALL"
+                    elif reads.get(rp) != "ALL":
+                        start = int(offset) if offset else 1
+                        end = start + int(limit) - 1 if limit else None
+                        reads.setdefault(rp, []).append((start, end))
+                elif name in ALL_TOOLS:
+                    # the file was written/changed this session -> touched in full
                     reads[rp] = "ALL"
-                elif reads.get(rp) != "ALL":
-                    start = int(offset) if offset else 1
-                    end = start + int(limit) - 1 if limit else None
-                    reads.setdefault(rp, []).append((start, end))
-            elif name in ALL_TOOLS:
-                # the file was written/changed this session -> touched in full
-                reads[rp] = "ALL"
+            elif btype == "tool_result":
+                if b.get("tool_use_id") in bash_ids:
+                    t = _tool_result_text(b)
+                    if t:
+                        bash_outputs.append(t)
         if role_of(entry) == "assistant":
             txt = "".join(
                 b.get("text", "")
@@ -277,8 +305,7 @@ def collect(transcript_path, cwd):
                 answer_parts.append(txt)
 
     last_assistant_text = "\n".join(answer_parts)
-
-    return reads, last_assistant_text
+    return reads, bash_outputs, last_assistant_text
 
 
 def line_was_read(reads, rp, line):
@@ -527,7 +554,7 @@ def main():
     # half-written fragment (see wait_for_stable_transcript).
     wait_for_stable_transcript(transcript_path)
 
-    reads, text = collect(transcript_path, cwd)
+    reads, bash_outputs, text = collect(transcript_path, cwd)
     findings, stats, cited = verify(text, reads, cwd)
     blocking = [f for f in findings if f[0] in BLOCK_CODES]
 
