@@ -84,6 +84,26 @@ def file_cite_regex():
 FILE_CITE = file_cite_regex()
 
 
+# All citable atom tokens (any grade), longest-first so the alternation prefers a
+# full name. The verifier uses this to slice a footnote into per-atom ownership
+# intervals: each backtick span is attributed to the atom immediately to its
+# left, so a Bash atom bounds a Read atom's quote region (and vice-versa) and a
+# filesystem span is never checked against a neighbour's source. Derived from
+# TOOLS so it cannot drift from the taxonomy.
+CITE_TOKENS = [t.name for t in TOOLS if t.atom]
+
+
+def atom_head_regex():
+    """Match the HEAD of any citation atom — a known tool token immediately
+    followed by '(' — anywhere in a footnote. The (?<![A-Za-z]) boundary stops a
+    short token matching inside a longer one (e.g. 'Edit' inside 'MultiEdit')."""
+    alt = "|".join(re.escape(n) for n in sorted(CITE_TOKENS, key=len, reverse=True))
+    return re.compile(r"(?<![A-Za-z])(" + alt + r")\s*\(")
+
+
+ATOM_HEAD = atom_head_regex()
+
+
 # --- citation style (cosmetic; the verifier matches the inner atom regardless) -
 # Citations are FOOTNOTES. At the claim you drop a tinted MARKER — an inline-code
 # span around a bracketed number, `[1]` — and at the END of the reply you DEFINE
@@ -317,6 +337,12 @@ def _check():
     assert ANY_CITATION.search(mark(1)), "inline marker not detected"
     assert ANY_CITATION.search(warn("x")), "unverified warning not detected"
     assert rx.search(cite("Read(f.py:1)")), "FILE_CITE fails on code-span atom"
+    # ATOM_HEAD finds the head of every citable atom (any grade), and the
+    # (?<![A-Za-z]) boundary keeps a short token from matching inside a longer one.
+    for t in TOOLS:
+        if t.atom:
+            assert ATOM_HEAD.search(t.name + "("), "ATOM_HEAD misses %s" % t.name
+    assert ATOM_HEAD.search("MultiEdit(").group(1) == "MultiEdit", "ATOM_HEAD picked short token"
     # backticked-span extraction: the shared verbatim-quote convention
     spans = BACKTICK_SPAN.findall("Bash(x) — `Ran 5 tests`, `OK`")
     assert spans == ["Ran 5 tests", "OK"], "BACKTICK_SPAN extraction wrong: %r" % spans

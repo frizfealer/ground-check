@@ -61,7 +61,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from grounding_spec import (  # noqa: E402
     ALL_TOOLS,
     ANY_CITATION,
+    ATOM_HEAD,
     BACKTICK_SPAN,
+    CHECKED,
     CITE_FULL_RE,
     FILE_CITE,
     RANGE_TOOLS,
@@ -343,9 +345,50 @@ def read_cited_text(path, start, end):
     return "\n".join(lines[lo - 1:hi])
 
 
-# A footnote whose leading atom is a Bash citation: its command is matched
-# against the session's recorded Bash calls (command presence).
-_BASH_ATOM_RE = re.compile(r"^\s*Bash\s*\(")
+def _match_close_paren(body, open_idx):
+    """Index just AFTER the ')' that closes the '(' at open_idx, by depth count
+    so nested parens inside a Bash command don't end the atom early. None if
+    unbalanced."""
+    depth = 0
+    for j in range(open_idx, len(body)):
+        c = body[j]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return None
+
+
+def _atoms_in(body):
+    """Every citation atom in a footnote body, in order, each with the character
+    span it occupies. An atom owns the backtick spans that fall after its
+    closing ')' and before the next atom — so a Bash atom bounds a Read atom's
+    quote region (and vice-versa) and every span is attributed to the atom on
+    its left. Returns dicts:
+        {token, text, start, end, path, line, end_line}
+    path/line/end_line are filled only for filesystem atoms (Read/Edit/Write/
+    MultiEdit, parsed via FILE_CITE)."""
+    out = []
+    for hm in ATOM_HEAD.finditer(body):
+        open_idx = hm.end() - 1            # the '(' the head matched
+        close = _match_close_paren(body, open_idx)
+        if close is None:
+            continue                       # unbalanced parens -> skip this atom
+        rec = {
+            "token": hm.group(1), "text": body[hm.start():close],
+            "start": hm.start(), "end": close,
+            "path": None, "line": None, "end_line": None,
+        }
+        if hm.group(1) in CHECKED:
+            fm = FILE_CITE.match(rec["text"])
+            if fm:
+                rec["path"] = fm.group(2)
+                rec["line"] = int(fm.group(3)) if fm.group(3) else None
+                rec["end_line"] = int(fm.group(4)) if fm.group(4) else None
+        out.append(rec)
+    return out
 
 
 def _bash_paren_span(body):
@@ -382,20 +425,49 @@ def _cited_command(body):
     return _normalize_cmd(inner)
 
 
-def _classify_recorded(body, bash_calls):
-    """Tier a non-filesystem footnote.
+def _check_fs_atom(a, owned, reads, cwd):
+    """(tier, finding|None, None) for a filesystem atom: pointer integrity first,
+    then — if the atom owns backtick spans — a verbatim content check of each
+    span against the cited line/range."""
+    atom, path, line, end = a["text"], a["path"], a["line"], a["end_line"]
+    abspath = resolve_path(path, cwd, list(reads.keys()))
+    if abspath is None:
+        return "FABRICATED", ("FABRICATED",
+            f"{atom} — no such file found "
+            f"(checked cwd, git root, and read files)"), None
+    if line is not None:
+        n = file_line_count(abspath)
+        if n is not None and line > n:
+            return "BAD_LINE", ("BAD_LINE",
+                f"{atom} — file now has only {n} lines "
+                f"(stale citation, or wrong line)"), None
+    rp = os.path.realpath(abspath)
+    read_state = line_was_read(reads, rp, line)
+    if read_state is None:
+        return "UNREAD_FILE", ("UNREAD_FILE",
+            f"{atom} — cited but not opened this session "
+            f"(ok if resumed from a prior session)"), None
+    if read_state is False:
+        return "UNREAD_LINE", ("UNREAD_LINE",
+            f"{atom} — file opened, but this line was never in a read range"), None
+    if owned:
+        cited_text = read_cited_text(abspath, line, end)
+        if cited_text is not None:
+            missing = [sp for sp in owned if sp not in cited_text]
+            if missing:
+                return "CONTENT_MISMATCH", ("CONTENT_MISMATCH",
+                    f"{atom} — quoted content not found at the cited "
+                    f"line/range: {missing[0]!r}"), None
+    return "pointer-verified", None, None
 
-    A Bash footnote is verified by COMMAND PRESENCE: the cited command must match
-    a command actually run this session (cited text, normalized, is a substring of
-    a recorded command). The verifier then surfaces that command's recorded output;
-    the model never transcribes output, so there is no output-mismatch failure.
-    Everything else (Web/Task/MCP/Grep/Glob/context) is 'asserted'.
 
-    Returns (tier, finding_or_None, detail_or_None), where detail for a
-    call-verified Bash citation is (n_runs, latest_output)."""
-    if not _BASH_ATOM_RE.match(body):
-        return "asserted", None, None
-    cited = _cited_command(body)
+def _check_bash_atom(atom_text, bash_calls):
+    """(tier, finding|None, detail|None) for a Bash atom, by COMMAND PRESENCE:
+    the command inside Bash(...) must be a substring of a command actually run
+    this session. detail for a call-verified citation is (n_runs, latest_output);
+    the verifier renders that output, the model never transcribes it. Backtick
+    spans after a Bash atom are description, not output — never checked."""
+    cited = _cited_command(atom_text)
     if not cited:
         return "asserted", None, None
     outs = [out for (cmd, out) in bash_calls if cited in _normalize_cmd(cmd)]
@@ -403,8 +475,8 @@ def _classify_recorded(body, bash_calls):
         return "command-not-found", (
             "command-not-found",
             "%s — no Bash call with this command was recorded this session "
-            "(misquoted command, or it ran in a different/resumed session)" % body,
-        ), None
+            "(misquoted command, or it ran in a different/resumed session)"
+            % atom_text), None
     return "call-verified", None, (len(outs), outs[-1])
 
 
@@ -424,17 +496,21 @@ def _tally(cited):
 def verify(text, reads, bash_calls, cwd):
     """Verify ONLY the footnote definitions — the authoritative citation list.
 
-    Each footnote is judged by its LEADING atom:
+    A footnote may carry MORE THAN ONE atom. Each atom is judged on its own and
+    owns the backtick spans that fall between its ')' and the next atom (the
+    nearest atom to a span's left), so a Bash atom bounds a Read atom's quote
+    region and vice-versa:
       - a filesystem atom (Read/Edit/Write/MultiEdit) is checked against disk and
-        the session reads; if its pointer holds and it backticks line content,
-        that span is checked against the cited line/range (CONTENT_MISMATCH on a
-        miss) — see Task 4.
+        the session reads; if its pointer holds and it owns backtick spans, each
+        is checked against ITS cited line/range (CONTENT_MISMATCH on a miss).
       - a Bash atom is checked by command presence against the session's recorded
-        Bash calls (call-verified / command-not-found); the verifier renders the
-        recorded output, the model does not transcribe it.
-      - anything else is "asserted".
+        Bash calls (call-verified / command-not-found); the command lives inside
+        its OWN parens, so trailing spans are description, never checked.
+      - anything else (Web/Task/MCP/Grep/Glob, or a footnote with no atom) is
+        "asserted".
     Spans the author did not backtick are never checked, so paraphrase never
-    false-positives.
+    false-positives; and a filesystem span is only ever checked against the
+    source of the atom that owns it, never a neighbour's.
     """
     findings = []  # (code, message)
     cited = []     # (display, tier, detail) per footnote, in order, de-duplicated
@@ -442,81 +518,35 @@ def verify(text, reads, bash_calls, cwd):
 
     for cm in CITE_FULL_RE.finditer(text or ""):
         body = cm.group(1).strip()
-        m = FILE_CITE.match(body)  # a checked filesystem atom at the START?
-        if not m:
-            if body in seen:
+        atoms = _atoms_in(body)
+        if not atoms:
+            # No atom at all (e.g. a `context — …` footnote): asserted whole.
+            if body not in seen:
+                seen.add(body)
+                cited.append((body, "asserted", None))
+            continue
+        spanms = list(BACKTICK_SPAN.finditer(body))
+        for i, a in enumerate(atoms):
+            display = a["text"]
+            if display in seen:
                 continue
-            seen.add(body)
-            tier, finding, detail = _classify_recorded(body, bash_calls)
+            seen.add(display)
+            # This atom owns the backtick spans between its ')' and the next
+            # atom, so a filesystem span is never checked against a neighbour's
+            # source. (Bash is checked by the command inside its OWN parens, not
+            # by trailing spans, so any spans it owns are ignored here.)
+            lo = a["end"]
+            hi = atoms[i + 1]["start"] if i + 1 < len(atoms) else len(body)
+            owned = [sm.group(1) for sm in spanms if lo <= sm.start() < hi]
+            if a["path"] is not None:            # a parsed filesystem atom
+                tier, finding, detail = _check_fs_atom(a, owned, reads, cwd)
+            elif a["token"] == "Bash":
+                tier, finding, detail = _check_bash_atom(display, bash_calls)
+            else:                                # Web/Task/MCP/Grep/Glob/…
+                tier, finding, detail = "asserted", None, None
             if finding:
                 findings.append(finding)
-            cited.append((body, tier, detail))
-            continue
-
-        atom = m.group(0)
-        if atom in seen:
-            continue
-        seen.add(atom)
-        path, s, e = m.group(2), m.group(3), m.group(4)
-        line = int(s) if s else None
-        end = int(e) if e else None
-        before = len(findings)
-
-        abspath = resolve_path(path, cwd, list(reads.keys()))
-        if abspath is None:
-            findings.append(
-                ("FABRICATED",
-                 f"{atom} — no such file found "
-                 f"(checked cwd, git root, and read files)")
-            )
-            cited.append((atom, "FABRICATED", None))
-            continue
-
-        if line is not None:
-            n = file_line_count(abspath)
-            if n is not None and line > n:
-                findings.append(
-                    ("BAD_LINE",
-                     f"{atom} — file now has only {n} lines "
-                     f"(stale citation, or wrong line)")
-                )
-                cited.append((atom, "BAD_LINE", None))
-                continue
-
-        rp = os.path.realpath(abspath)
-        read_state = line_was_read(reads, rp, line)
-        if read_state is None:
-            findings.append(
-                ("UNREAD_FILE",
-                 f"{atom} — cited but not opened this session "
-                 f"(ok if resumed from a prior session)")
-            )
-        elif read_state is False:
-            findings.append(
-                ("UNREAD_LINE",
-                 f"{atom} — file opened, but this line was never in a read range")
-            )
-
-        if len(findings) != before:
-            cited.append((atom, findings[-1][0], None))  # pointer failure
-            continue
-
-        # Pointer holds. Opt-in content check: if the footnote backticks the cited
-        # line content, confirm each span is verbatim at the cited line/range.
-        spans = BACKTICK_SPAN.findall(body[m.end():])
-        if spans:
-            cited_text = read_cited_text(abspath, line, end)
-            if cited_text is not None:
-                missing = [sp for sp in spans if sp not in cited_text]
-                if missing:
-                    findings.append(
-                        ("CONTENT_MISMATCH",
-                         f"{atom} — quoted content not found at the cited "
-                         f"line/range: {missing[0]!r}")
-                    )
-                    cited.append((atom, "CONTENT_MISMATCH", None))
-                    continue
-        cited.append((atom, "pointer-verified", None))
+            cited.append((display, tier, detail))
 
     stats = _tally(cited)
 
