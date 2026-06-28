@@ -351,7 +351,7 @@ _OFF_VALUES = ("off", "0", "false", "no")
 def _flag_path():
     base = (os.environ.get("CLAUDE_CONFIG_DIR")
             or os.path.join(os.path.expanduser("~"), ".claude"))
-    return os.path.join(base, "grounding-attribution", "grounding-enabled")
+    return os.path.join(base, "ground-check", "grounding-enabled")
 
 
 def is_enabled():

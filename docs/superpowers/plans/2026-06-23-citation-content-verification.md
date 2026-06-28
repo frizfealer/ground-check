@@ -19,7 +19,7 @@
 - **Warn-only default:** `BLOCK_CODES = set()` stays empty. Never add `CONTENT_MISMATCH` or `BASH_OUTPUT_MISMATCH` to it.
 - **Single source of truth:** the backtick regex lives once in `grounding_spec.py` as `BACKTICK_SPAN` and is imported by the verifier — never duplicate it.
 - When **no content is backticked**, behavior must be byte-for-byte identical to today (no new findings, same tiers).
-- All commands run from the worktree root: `/Users/yeu-chernharn/grounding-attribution/.claude/worktrees/citation-content-verification`. Tests derive their own repo path, so they pass regardless of cwd.
+- All commands run from the worktree root: `/Users/yeu-chernharn/ground-check/.claude/worktrees/citation-content-verification`. Tests derive their own repo path, so they pass regardless of cwd.
 - Commit messages use conventional-commit prefixes and end with:
   `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
 
