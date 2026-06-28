@@ -1,12 +1,12 @@
 ---
-description: Toggle grounding attribution (citation policy + verifier) on or off
+description: Toggle GroundCheck (citation policy + verifier) on or off
 argument-hint: [on/off]
 disable-model-invocation: true
 ---
 
 !`python3 ${CLAUDE_PLUGIN_ROOT}/scripts/grounding_spec.py --set "$ARGUMENTS"`
 
-The current grounding-attribution state is shown above.
+The current GroundCheck state is shown above.
 
 - `/grounding on` — enable the citation policy and the verifier
 - `/grounding off` — disable both (the policy stops being injected and the verifier no-ops)

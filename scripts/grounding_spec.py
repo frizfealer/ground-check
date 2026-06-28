@@ -351,7 +351,7 @@ _OFF_VALUES = ("off", "0", "false", "no")
 def _flag_path():
     base = (os.environ.get("CLAUDE_CONFIG_DIR")
             or os.path.join(os.path.expanduser("~"), ".claude"))
-    return os.path.join(base, "grounding-attribution", "grounding-enabled")
+    return os.path.join(base, "ground-check", "grounding-enabled")
 
 
 def is_enabled():
@@ -389,7 +389,7 @@ def main(argv):
         elif value == "toggle":
             set_enabled(not is_enabled())
         # "" or anything else -> report current state without changing it
-        print("grounding attribution: %s" % ("on" if is_enabled() else "off"))
+        print("GroundCheck: %s" % ("on" if is_enabled() else "off"))
         return 0
     sys.stderr.write(
         "usage: grounding_spec.py [--emit-policy | --check | --set on|off|toggle]\n")
